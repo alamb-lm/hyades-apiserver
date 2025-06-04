@@ -18,6 +18,8 @@
  */
 package org.dependencytrack.integrations.gitlab;
 
+import net.minidev.json.JSONObject;
+import alpine.Config;
 import alpine.event.framework.Event;
 import alpine.model.OidcUser;
 import alpine.server.auth.DefaultOidcAuthenticationCustomizer;
@@ -30,7 +32,35 @@ import java.util.Objects;
 import org.dependencytrack.event.GitLabSyncEvent;
 import org.dependencytrack.persistence.QueryManager;
 
+import com.nimbusds.openid.connect.sdk.claims.ClaimsSet;
+import com.nimbusds.openid.connect.sdk.claims.UserInfo;
+
 public class GitLabAuthenticationCustomizer extends DefaultOidcAuthenticationCustomizer {
+
+    @Override
+    public OidcProfile createProfile(ClaimsSet claimsSet) {
+        final String teamsClaimName = Config.getInstance().getProperty(Config.AlpineKey.OIDC_TEAMS_CLAIM);
+        final String usernameClaimName = Config.getInstance().getProperty(Config.AlpineKey.OIDC_USERNAME_CLAIM);
+        final var profile = new OidcProfile();
+
+        profile.setSubject(Objects.requireNonNullElse(claimsSet.getStringClaim("user_id"),
+                claimsSet.getStringClaim(UserInfo.SUB_CLAIM_NAME)));
+        profile.setUsername(Objects.requireNonNullElse(claimsSet.getStringClaim("user_login"),
+                claimsSet.getStringClaim(usernameClaimName)));
+        profile.setGroups(claimsSet.getStringListClaim(teamsClaimName));
+        profile.setEmail(Objects.requireNonNullElse(claimsSet.getStringClaim("user_email"),
+                claimsSet.getStringClaim(UserInfo.EMAIL_CLAIM_NAME)));
+
+        JSONObject claimsObj = claimsSet.toJSONObject();
+        claimsObj.remove(UserInfo.EMAIL_CLAIM_NAME);
+        claimsObj.remove(UserInfo.SUB_CLAIM_NAME);
+        claimsObj.remove(teamsClaimName);
+        claimsObj.remove(usernameClaimName);
+
+        profile.setCustomValues(claimsObj);
+
+        return profile;
+    }
 
     @Override
     public boolean isProfileComplete(OidcProfile profile, boolean teamSyncEnabled) {

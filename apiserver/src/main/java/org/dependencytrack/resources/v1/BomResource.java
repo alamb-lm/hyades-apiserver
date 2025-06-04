@@ -18,12 +18,20 @@
  */
 package org.dependencytrack.resources.v1;
 
+import alpine.Config;
+import alpine.Config.AlpineKey;
 import alpine.common.logging.Logger;
 import alpine.event.framework.Event;
 import alpine.model.ConfigProperty;
 import alpine.notification.Notification;
 import alpine.notification.NotificationLevel;
 import alpine.server.auth.PermissionRequired;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.ExpiredJwtException;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.MalformedJwtException;
+import io.jsonwebtoken.UnsupportedJwtException;
+import io.jsonwebtoken.security.SignatureException;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -64,6 +72,9 @@ import org.dependencytrack.storage.FileStorage;
 import org.glassfish.jersey.media.multipart.BodyPartEntity;
 import org.glassfish.jersey.media.multipart.FormDataBodyPart;
 import org.glassfish.jersey.media.multipart.FormDataParam;
+import org.owasp.security.logging.SecurityMarkers;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import jakarta.json.Json;
 import jakarta.json.JsonArray;
@@ -82,21 +93,34 @@ import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import net.minidev.json.JSONObject;
+
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.StringReader;
+import java.math.BigInteger;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
 import java.security.Principal;
+import java.security.PublicKey;
+import java.security.spec.RSAPublicKeySpec;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static java.util.function.Predicate.not;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_MODE;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_TAGS_EXCLUSIVE;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_TAGS_INCLUSIVE;
+import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_SBOM_PUSH_ENABLED;
+import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_URL;
 
 /**
  * JAX-RS resources for processing bill-of-material (bom) documents.
@@ -351,6 +375,88 @@ public class BomResource extends AbstractApiResource {
             }
         }
     }
+
+    @POST
+    @Path("/gitlab")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(
+            summary = "Upload a supported bill of material from GitLab", 
+            description = "This endpoint processes input and delegates the request to the uploadBom method.")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Token to be used for checking BOM processing progress", content = @Content(schema = @Schema(implementation = BomUploadResponse.class))),
+            @ApiResponse(responseCode = "400", description = "Invalid input"),
+            @ApiResponse(responseCode = "401", description = "Unauthorized"),
+            @ApiResponse(responseCode = "404", description = "The project could not be found")
+    })
+    @PermissionRequired(Permissions.Constants.BOM_UPLOAD)
+    public Response uploadBomGitLab(
+            @FormDataParam("gitLab_token") String idToken,
+            @FormDataParam("bom") String bom,
+            @FormDataParam("autoCreate") @DefaultValue("false") boolean autoCreate,
+            @FormDataParam("isLatest") @DefaultValue("false") boolean isLatest) {
+        try (QueryManager qm = new QueryManager()) {
+            boolean gitLabEnabled = Boolean.parseBoolean(
+                    qm.getConfigProperty(
+                            GITLAB_SBOM_PUSH_ENABLED.getGroupName(),
+                            GITLAB_SBOM_PUSH_ENABLED.getPropertyName()).getPropertyValue());
+
+            if (!gitLabEnabled)
+                return Response.notModified("GitLab integration not enabled").build();
+
+            if (idToken == null || !idToken.matches("^[\\w-]+\\.[\\w-]+\\.[\\w-]+$"))
+                return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid or missing GitLab idToken")
+                        .build();
+
+            String gitLabJwksUrl = "%s%s".formatted(Config.getInstance().getProperty(AlpineKey.OIDC_ISSUER),
+                    "/oauth/discovery/keys");
+
+            // Get the key id (kid) from the JWT header
+            String headerJson = new String(Base64.getUrlDecoder().decode(idToken.split("\\.")[0]));
+            String kid = (String) new ObjectMapper().readValue(headerJson, Map.class).get("kid");
+
+            Claims claims = Jwts.parser()
+                    .verifyWith(
+                            getPublicKeyFromJwks(getJwks(gitLabJwksUrl), kid))
+                    .build()
+                    .parseSignedClaims(idToken)
+                    .getPayload();
+
+            if (claims.get("project_path", String.class) == null) 
+                return Response.status(Response.Status.BAD_REQUEST).entity("Missing project_path claim").build();
+            
+            if (!claims.get("ref_type", String.class).equals("tag") && claims.get("ref_path", String.class) == null)
+                return Response.status(Response.Status.BAD_REQUEST).entity("Invalid ref_type or missing ref_path claim")
+                        .build();
+
+            BomSubmitRequest bomSubmitRequest = new BomSubmitRequest(
+                    null,
+                    List.of(claims.get("project_path", String.class).split("/")).getLast(),
+                    claims.get(claims.get("ref_type", String.class).equals("tag") ? "ref" : "ref_path", String.class),
+                    null,
+                    autoCreate,
+                    isLatest,
+                    bom);
+
+            return uploadBom(bomSubmitRequest);
+        } catch (SignatureException e) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                    .entity("Received token that did not pass signature verification").build();
+        } catch (ExpiredJwtException e) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity("Received expired token").build();
+        } catch (MalformedJwtException e) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity("Received malformed token").build();
+        } catch (UnsupportedJwtException | IllegalArgumentException e) {
+            LOGGER.error(SecurityMarkers.SECURITY_FAILURE, e.getMessage());
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity("Received unsupported JWT").build();
+        } catch (IOException e) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                    .entity("Error reading or parsing the JWT header or JWKS: " + e.getMessage()).build();
+        } catch (Exception e) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                    .entity("An error occured in uploadBomGitLab: " + e.getMessage()).build();
+        }
+    }    
 
     @POST
     @Consumes(MediaType.MULTIPART_FORM_DATA)
@@ -636,5 +742,67 @@ public class BomResource extends AbstractApiResource {
             return (validationMode == BomValidationMode.ENABLED_FOR_TAGS && doTagsMatch)
                    || (validationMode == BomValidationMode.DISABLED_FOR_TAGS && !doTagsMatch);
         }
+    }
+
+    private static JSONObject getJwks(String jwksUrl) throws IOException, InterruptedException {
+        LOGGER.info("Getting JWKS from URL: " + jwksUrl);
+        HttpClient client = HttpClient.newHttpClient();
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(jwksUrl))
+            .header("Accept", "application/json")
+            .GET()
+            .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) 
+            throw new IOException("Failed to fetch JWKS from URL: " + jwksUrl + ". Status code: " + response.statusCode());
+
+        if (!response.body().trim().startsWith("{"))
+            throw new IOException("Unexpected response: " + response.body());
+
+        LOGGER.info("JWKS response: " + response.body());
+
+        return new ObjectMapper().readValue(response.body(), JSONObject.class);
+    }
+
+    private static PublicKey getPublicKeyFromJwks(JSONObject jwks, String kid) throws Exception {
+        LOGGER.info("Getting public key from JWKS for kid: " + kid);
+        Object keysObject = jwks.get("keys");
+        if (!(keysObject instanceof List<?>))
+            throw new IllegalArgumentException("Invalid JWKS format: 'keys' is not a list");
+
+        List<?> keys = (List<?>) keysObject;
+
+        for (Object key : keys) {
+            if (!(key instanceof Map<?, ?>))
+                throw new IllegalArgumentException("Invalid JWKS format: key is not a map");
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> keyMap = (Map<String, Object>) key;
+                    
+            JSONObject jsonKey = new JSONObject();
+            jsonKey.put("kty", keyMap.get("kty"));
+            jsonKey.put("alg", keyMap.get("alg"));
+            jsonKey.put("use", keyMap.get("use"));
+            jsonKey.put("kid", keyMap.get("kid"));
+            jsonKey.put("n", keyMap.get("n"));
+            jsonKey.put("e", keyMap.get("e"));
+            LOGGER.info("jsonKey: " + jsonKey + "(" + jsonKey.getClass() + ")");
+            
+            if (jsonKey.get("kid").equals(kid)) {
+                if (!jsonKey.containsKey("n") || !jsonKey.containsKey("e"))
+                    throw new IllegalArgumentException("Missing modulus 'n' or exponent 'e' in JWKS key: " + jsonKey);
+                
+                LOGGER.info("Found matching key for kid: " + kid);
+                RSAPublicKeySpec spec = new RSAPublicKeySpec(
+                    new BigInteger(1, Base64.getUrlDecoder().decode(jsonKey.get("n").toString())), 
+                    new BigInteger(1, Base64.getUrlDecoder().decode(jsonKey.get("e").toString()))
+                    );
+                
+                return KeyFactory.getInstance("RSA").generatePublic(spec);
+            }
+        }
+        throw new IllegalArgumentException("Public key not found for kid: " + kid);
     }
 }

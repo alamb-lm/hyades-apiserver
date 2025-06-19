@@ -483,10 +483,13 @@ public class QueryManager extends AlpineQueryManager {
      * @return A {@link Set} of {@link UserProjectRole} IDs
      */
     protected Set<Long> getRoleIds(final Principal principal, final Project project) {
+        if (!(principal instanceof User user))
+            return Collections.emptySet();
+
         final Query<UserProjectRole> query = pm.newQuery(UserProjectRole.class)
-                .filter("project.id == :projectId && users.contains(:principal)")
+                .filter("this.project.id == :projectId && this.user.id == :userId")
                 .setNamedParameters(Map.ofEntries(
-                    Map.entry("principal", principal),
+                    Map.entry("userId", user.getId()),
                     Map.entry("projectId", project.getId())))
                 .result("this.id");
 

@@ -1020,11 +1020,10 @@ final class ProjectQueryManager extends QueryManager implements IQueryManager {
         if (teamIds.isEmpty() && roleIds.isEmpty())
             return false;
 
-        final Query<?> query = pm.newQuery(Query.SQL, "SELECT HAS_PROJECT_ACCESS(:projectId, :teamIds, :roleIds)");
+        final Query<?> query = pm.newQuery(Query.SQL, "SELECT HAS_PROJECT_ACCESS(:projectId, :teamIds)");
         query.setNamedParameters(Map.ofEntries(
                 Map.entry("projectId", project.getId()),
-                Map.entry("teamIds", teamIds.toArray(Long[]::new)),
-                Map.entry("roleIds", roleIds.toArray(Long[]::new))));
+                Map.entry("teamIds", teamIds.toArray(Long[]::new))));
 
         return executeAndCloseResultUnique(query, Boolean.class);
     }

@@ -114,11 +114,14 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 import static java.util.function.Predicate.not;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_MODE;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_TAGS_EXCLUSIVE;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_TAGS_INCLUSIVE;
+import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_ENABLED;
+import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_JWKS_PATH;
 import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_SBOM_PUSH_ENABLED;
 import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_URL;
 
@@ -380,9 +383,7 @@ public class BomResource extends AbstractApiResource {
     @Path("/gitlab")
     @Consumes(MediaType.MULTIPART_FORM_DATA)
     @Produces(MediaType.APPLICATION_JSON)
-    @Operation(
-            summary = "Upload a supported bill of material from GitLab", 
-            description = "This endpoint processes input and delegates the request to the uploadBom method.")
+    @Operation(summary = "Upload a supported bill of material from GitLab", description = "This endpoint processes input and delegates the request to the uploadBom method.")
     @ApiResponses(value = {
             @ApiResponse(responseCode = "200", description = "Token to be used for checking BOM processing progress", content = @Content(schema = @Schema(implementation = BomUploadResponse.class))),
             @ApiResponse(responseCode = "400", description = "Invalid input"),
@@ -395,36 +396,44 @@ public class BomResource extends AbstractApiResource {
             @FormDataParam("bom") String bom,
             @FormDataParam("autoCreate") @DefaultValue("false") boolean autoCreate,
             @FormDataParam("isLatest") @DefaultValue("false") boolean isLatest) {
-        try (QueryManager qm = new QueryManager()) {
-            boolean gitLabEnabled = Boolean.parseBoolean(
-                    qm.getConfigProperty(
-                            GITLAB_SBOM_PUSH_ENABLED.getGroupName(),
-                            GITLAB_SBOM_PUSH_ENABLED.getPropertyName()).getPropertyValue());
 
-            if (!gitLabEnabled)
+        try (QueryManager qm = new QueryManager()) {
+            Function<ConfigPropertyConstants, ConfigProperty> propertyGetter = cpc -> qm.getConfigProperty(
+                    cpc.getGroupName(),
+                    cpc.getPropertyName());
+
+            ConfigProperty gitLabIntegrationConfigProperty = propertyGetter.apply(GITLAB_ENABLED);
+            if (gitLabIntegrationConfigProperty == null
+                    || !Boolean.parseBoolean(gitLabIntegrationConfigProperty.getPropertyValue()))
                 return Response.notModified("GitLab integration not enabled").build();
+
+            ConfigProperty sbomPushConfigProperty = propertyGetter.apply(GITLAB_SBOM_PUSH_ENABLED);
+            if (sbomPushConfigProperty == null || !Boolean.parseBoolean(sbomPushConfigProperty.getPropertyValue()))
+                return Response.notModified("GitLab SBOM push functionality not enabled").build();
 
             if (idToken == null || !idToken.matches("^[\\w-]+\\.[\\w-]+\\.[\\w-]+$"))
                 return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid or missing GitLab idToken")
                         .build();
 
-            String gitLabJwksUrl = "%s%s".formatted(Config.getInstance().getProperty(AlpineKey.OIDC_ISSUER),
-                    "/oauth/discovery/keys");
+            ConfigProperty gitLabUrlProperty = propertyGetter.apply(GITLAB_URL);
+            ConfigProperty gitLabJwksPathProperty = propertyGetter.apply(GITLAB_JWKS_PATH);
+
+            String gitLabJwksUrl = gitLabUrlProperty.getPropertyValue() + gitLabJwksPathProperty.getPropertyValue();
+            LOGGER.info("gitlabJwksUrl: " + gitLabJwksUrl);
 
             // Get the key id (kid) from the JWT header
             String headerJson = new String(Base64.getUrlDecoder().decode(idToken.split("\\.")[0]));
             String kid = (String) new ObjectMapper().readValue(headerJson, Map.class).get("kid");
 
             Claims claims = Jwts.parser()
-                    .verifyWith(
-                            getPublicKeyFromJwks(getJwks(gitLabJwksUrl), kid))
+                    .verifyWith(getPublicKeyFromJwks(getJwks(gitLabJwksUrl), kid))
                     .build()
                     .parseSignedClaims(idToken)
                     .getPayload();
 
-            if (claims.get("project_path", String.class) == null) 
+            if (claims.get("project_path", String.class) == null)
                 return Response.status(Response.Status.BAD_REQUEST).entity("Missing project_path claim").build();
-            
+
             if (!claims.get("ref_type", String.class).equals("tag") && claims.get("ref_path", String.class) == null)
                 return Response.status(Response.Status.BAD_REQUEST).entity("Invalid ref_type or missing ref_path claim")
                         .build();
@@ -456,7 +465,7 @@ public class BomResource extends AbstractApiResource {
             return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
                     .entity("An error occured in uploadBomGitLab: " + e.getMessage()).build();
         }
-    }    
+    }
 
     @POST
     @Consumes(MediaType.MULTIPART_FORM_DATA)

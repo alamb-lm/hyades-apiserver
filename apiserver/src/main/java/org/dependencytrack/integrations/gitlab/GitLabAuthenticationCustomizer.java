@@ -40,14 +40,15 @@ public class GitLabAuthenticationCustomizer extends DefaultOidcAuthenticationCus
     @Override
     public OidcProfile createProfile(ClaimsSet claimsSet) {
         final String teamsClaimName = Config.getInstance().getProperty(Config.AlpineKey.OIDC_TEAMS_CLAIM);
-        final String usernameClaimName = Config.getInstance().getProperty(Config.AlpineKey.OIDC_USERNAME_CLAIM);
+        String usernameClaimName = Config.getInstance().getProperty(Config.AlpineKey.OIDC_USERNAME_CLAIM);
         final var profile = new OidcProfile();
+
+        if (claimsSet.getStringClaim("user_login") != null)
+            usernameClaimName = "user_login";
 
         profile.setSubject(Objects.requireNonNullElse(claimsSet.getStringClaim("user_id"),
                 claimsSet.getStringClaim(UserInfo.SUB_CLAIM_NAME)));
-        profile.setUsername(Objects.requireNonNullElse(claimsSet.getStringClaim("user_login"),
-                claimsSet.getStringClaim(usernameClaimName)));
-        profile.setGroups(claimsSet.getStringListClaim(teamsClaimName));
+        profile.setUsername(claimsSet.getStringClaim(usernameClaimName));
         profile.setEmail(Objects.requireNonNullElse(claimsSet.getStringClaim("user_email"),
                 claimsSet.getStringClaim(UserInfo.EMAIL_CLAIM_NAME)));
 
@@ -60,11 +61,6 @@ public class GitLabAuthenticationCustomizer extends DefaultOidcAuthenticationCus
         profile.setCustomValues(claimsObj);
 
         return profile;
-    }
-
-    @Override
-    public boolean isProfileComplete(OidcProfile profile, boolean teamSyncEnabled) {
-        return super.isProfileComplete(profile, true);
     }
 
     @Override

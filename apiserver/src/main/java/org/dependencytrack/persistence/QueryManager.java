@@ -500,7 +500,7 @@ public class QueryManager extends AlpineQueryManager {
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     public List<Project> getAllProjects() {
-        return getProjectQueryManager().getAllProjects();ß
+        return getProjectQueryManager().getAllProjects();
     }
 
     public List<Project> getAllProjects(boolean excludeInactive) {

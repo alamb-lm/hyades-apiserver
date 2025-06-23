@@ -18,8 +18,6 @@
  */
 package org.dependencytrack.resources.v1;
 
-import alpine.Config;
-import alpine.Config.AlpineKey;
 import alpine.common.logging.Logger;
 import alpine.event.framework.Event;
 import alpine.model.ConfigProperty;

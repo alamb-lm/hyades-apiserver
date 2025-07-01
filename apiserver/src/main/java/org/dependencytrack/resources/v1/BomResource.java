@@ -18,8 +18,6 @@
  */
 package org.dependencytrack.resources.v1;
 
-import alpine.Config;
-import alpine.Config.AlpineKey;
 import alpine.common.logging.Logger;
 import alpine.event.framework.Event;
 import alpine.model.ConfigProperty;
@@ -98,7 +96,6 @@ import net.minidev.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.StringReader;
 import java.math.BigInteger;
 import java.net.URI;

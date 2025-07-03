@@ -481,7 +481,7 @@ public class QueryManager extends AlpineQueryManager {
     }
 
     /**
-ß     * Get the IDs of the {@link Team}s a given {@link Principal} is a member of.
+     * Get the IDs of the {@link Team}s a given {@link Principal} is a member of.
      *
      * @return A {@link Set} of {@link Team} IDs
      */

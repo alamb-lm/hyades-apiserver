@@ -119,6 +119,7 @@ import static java.util.function.Predicate.not;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_MODE;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_TAGS_EXCLUSIVE;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_TAGS_INCLUSIVE;
+import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_AUTOCREATE_PROJECTS;
 import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_ENABLED;
 import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_JWKS_PATH;
 import static org.dependencytrack.model.ConfigPropertyConstants.GITLAB_SBOM_PUSH_ENABLED;
@@ -360,18 +361,7 @@ public class BomResource extends AbstractApiResource {
                             }
                             requireAccess(qm, parent, "Access to the specified parent project is forbidden");
                         }
-                        final String trimmedProjectName = StringUtils.trimToNull(request.getProjectName());
-                        if (request.isLatestProjectVersion()) {
-                            final Project oldLatest = qm.getLatestProjectVersion(trimmedProjectName);
-                            if(oldLatest != null) {
-                                requireAccess(qm, oldLatest, "Access to the previous latest project version is forbidden");
-                            }
-                        }
-                        project = qm.createProject(trimmedProjectName, null,
-                                StringUtils.trimToNull(request.getProjectVersion()), request.getProjectTags(), parent,
-                                null, null, request.isLatestProjectVersion(), true);
-                        Principal principal = getPrincipal();
-                        qm.updateNewProjectACL(project, principal);
+                        createNewProject(request.getProjectName(), request.getProjectVersion(), request.getProjectTags(), parent, request.isLatestProjectVersion());
                     } else {
                         return Response.status(Response.Status.UNAUTHORIZED).entity("The principal does not have permission to create project.").build();
                     }
@@ -396,7 +386,6 @@ public class BomResource extends AbstractApiResource {
     public Response uploadBomGitLab(
             @FormDataParam("gitLab_token") String idToken,
             @FormDataParam("bom") String bom,
-            @FormDataParam("autoCreate") @DefaultValue("false") boolean autoCreate,
             @FormDataParam("isLatest") @DefaultValue("false") boolean isLatest) {
 
         try (QueryManager qm = new QueryManager()) {
@@ -413,6 +402,9 @@ public class BomResource extends AbstractApiResource {
             if (sbomPushConfigProperty == null || !Boolean.parseBoolean(sbomPushConfigProperty.getPropertyValue()))
                 return Response.notModified("GitLab SBOM push functionality not enabled").build();
 
+            Boolean autoCreateProject = Boolean
+                    .parseBoolean(propertyGetter.apply(GITLAB_AUTOCREATE_PROJECTS).getPropertyValue());
+
             if (idToken == null || !idToken.matches("^[\\w-]+\\.[\\w-]+\\.[\\w-]+$"))
                 return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid or missing GitLab idToken")
                         .build();
@@ -421,7 +413,6 @@ public class BomResource extends AbstractApiResource {
             ConfigProperty gitLabJwksPathProperty = propertyGetter.apply(GITLAB_JWKS_PATH);
 
             String gitLabJwksUrl = gitLabUrlProperty.getPropertyValue() + gitLabJwksPathProperty.getPropertyValue();
-            LOGGER.info("gitlabJwksUrl: " + gitLabJwksUrl);
 
             // Get the key id (kid) from the JWT header
             String headerJson = new String(Base64.getUrlDecoder().decode(idToken.split("\\.")[0]));
@@ -433,6 +424,20 @@ public class BomResource extends AbstractApiResource {
                     .parseSignedClaims(idToken)
                     .getPayload();
 
+            // If autoCreate is enabled and the project doesn't exist, create the project
+            final String projectName = List.of(claims.get("project_path", String.class).split("/")).getLast();
+            final String projectVersion = claims
+                    .get(claims.get("ref_type", String.class).equals("tag") ? "ref" : "ref_path", String.class);
+            Project project = qm.getProject(projectName, projectVersion);
+            if (project == null) {
+                if (autoCreateProject
+                        && Set.of("owner", "maintainer").contains(claims.get("user_access_level", String.class)))
+                    createNewProject(projectName, projectVersion, null, null, isLatest);
+                else
+                    return Response.status(Response.Status.UNAUTHORIZED)
+                            .entity("The principal does not have permission to create project.").build();
+            }
+
             if (claims.get("project_path", String.class) == null)
                 return Response.status(Response.Status.BAD_REQUEST).entity("Missing project_path claim").build();
 
@@ -442,10 +447,10 @@ public class BomResource extends AbstractApiResource {
 
             BomSubmitRequest bomSubmitRequest = new BomSubmitRequest(
                     null,
-                    List.of(claims.get("project_path", String.class).split("/")).getLast(),
-                    claims.get(claims.get("ref_type", String.class).equals("tag") ? "ref" : "ref_path", String.class),
+                    projectName,
+                    projectVersion,
                     null,
-                    autoCreate,
+                    autoCreateProject,
                     isLatest,
                     bom);
 
@@ -555,18 +560,10 @@ public class BomResource extends AbstractApiResource {
                             }
                             requireAccess(qm, parent, "Access to the specified parent project is forbidden");
                         }
-                        if (isLatest) {
-                            final Project oldLatest = qm.getLatestProjectVersion(trimmedProjectName);
-                            if(oldLatest != null) {
-                                requireAccess(qm, oldLatest, "Access to the previous latest project version is forbidden");
-                            }
-                        }
                         final List<org.dependencytrack.model.Tag> tags = (projectTags != null && !projectTags.isBlank())
                                 ? Arrays.stream(projectTags.split(",")).map(String::trim).filter(not(String::isEmpty)).map(org.dependencytrack.model.Tag::new).toList()
                                 : null;
-                        project = qm.createProject(trimmedProjectName, null, trimmedProjectVersion, tags, parent, null, null, isLatest, true);
-                        Principal principal = getPrincipal();
-                        qm.updateNewProjectACL(project, principal);
+                        createNewProject(projectName, projectVersion, tags, parent, isLatest);
                     } else {
                         return Response.status(Response.Status.UNAUTHORIZED).entity("The principal does not have permission to create project.").build();
                     }
@@ -755,14 +752,34 @@ public class BomResource extends AbstractApiResource {
         }
     }
 
+    private void createNewProject(String projectName, String projectVersion,
+            List<org.dependencytrack.model.Tag> projectTags, Project parent,
+            boolean isLatestProjectVersion) {
+        try (QueryManager qm = new QueryManager()) {
+            final String trimmedProjectName = StringUtils.trimToNull(projectName);
+            final String trimmedProjectVersion = StringUtils.trimToNull(projectVersion);
+
+            if (isLatestProjectVersion) {
+                final Project oldLatest = qm.getLatestProjectVersion(trimmedProjectName);
+                if (oldLatest != null) {
+                    requireAccess(qm, oldLatest, "Access to the previous latest project version is forbidden");
+                }
+            }
+            Project project = qm.createProject(trimmedProjectName, null,
+                    trimmedProjectVersion, projectTags, parent,
+                    null, null, isLatestProjectVersion, true);
+            Principal principal = getPrincipal();
+            qm.updateNewProjectACL(project, principal);
+        }
+    }
+
     private static JSONObject getJwks(String jwksUrl) throws IOException, InterruptedException {
-        LOGGER.info("Getting JWKS from URL: " + jwksUrl);
         HttpClient client = HttpClient.newHttpClient();
         HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(jwksUrl))
-            .header("Accept", "application/json")
-            .GET()
-            .build();
+                .uri(URI.create(jwksUrl))
+                .header("Accept", "application/json")
+                .GET()
+                .build();
 
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
@@ -772,13 +789,10 @@ public class BomResource extends AbstractApiResource {
         if (!response.body().trim().startsWith("{"))
             throw new IOException("Unexpected response: " + response.body());
 
-        LOGGER.info("JWKS response: " + response.body());
-
         return new ObjectMapper().readValue(response.body(), JSONObject.class);
     }
 
     private static PublicKey getPublicKeyFromJwks(JSONObject jwks, String kid) throws Exception {
-        LOGGER.info("Getting public key from JWKS for kid: " + kid);
         Object keysObject = jwks.get("keys");
         if (!(keysObject instanceof List<?>))
             throw new IllegalArgumentException("Invalid JWKS format: 'keys' is not a list");
@@ -799,13 +813,11 @@ public class BomResource extends AbstractApiResource {
             jsonKey.put("kid", keyMap.get("kid"));
             jsonKey.put("n", keyMap.get("n"));
             jsonKey.put("e", keyMap.get("e"));
-            LOGGER.info("jsonKey: " + jsonKey + "(" + jsonKey.getClass() + ")");
             
             if (jsonKey.get("kid").equals(kid)) {
                 if (!jsonKey.containsKey("n") || !jsonKey.containsKey("e"))
                     throw new IllegalArgumentException("Missing modulus 'n' or exponent 'e' in JWKS key: " + jsonKey);
                 
-                LOGGER.info("Found matching key for kid: " + kid);
                 RSAPublicKeySpec spec = new RSAPublicKeySpec(
                     new BigInteger(1, Base64.getUrlDecoder().decode(jsonKey.get("n").toString())), 
                     new BigInteger(1, Base64.getUrlDecoder().decode(jsonKey.get("e").toString()))

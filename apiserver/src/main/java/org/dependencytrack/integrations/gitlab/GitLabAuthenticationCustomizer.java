@@ -18,7 +18,6 @@
  */
 package org.dependencytrack.integrations.gitlab;
 
-import net.minidev.json.JSONObject;
 import alpine.Config;
 import alpine.event.framework.Event;
 import alpine.model.OidcUser;
@@ -34,6 +33,7 @@ import org.dependencytrack.persistence.QueryManager;
 
 import com.nimbusds.openid.connect.sdk.claims.ClaimsSet;
 import com.nimbusds.openid.connect.sdk.claims.UserInfo;
+import net.minidev.json.JSONObject;
 
 public class GitLabAuthenticationCustomizer extends DefaultOidcAuthenticationCustomizer {
 

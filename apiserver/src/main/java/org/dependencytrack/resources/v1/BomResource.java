@@ -49,6 +49,7 @@ import org.dependencytrack.auth.Permissions;
 import org.dependencytrack.event.BomUploadEvent;
 import org.dependencytrack.event.kafka.KafkaEventDispatcher;
 import org.dependencytrack.filestorage.FileStorage;
+import org.dependencytrack.integrations.gitlab.GitLabClient;
 import org.dependencytrack.model.BomValidationMode;
 import org.dependencytrack.model.Component;
 import org.dependencytrack.model.ConfigPropertyConstants;
@@ -92,21 +93,11 @@ import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
-import net.minidev.json.JSONObject;
-
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.StringReader;
-import java.math.BigInteger;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.security.KeyFactory;
 import java.security.Principal;
-import java.security.PublicKey;
-import java.security.spec.RSAPublicKeySpec;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
@@ -412,22 +403,23 @@ public class BomResource extends AbstractApiResource {
             ConfigProperty gitLabUrlProperty = propertyGetter.apply(GITLAB_URL);
             ConfigProperty gitLabJwksPathProperty = propertyGetter.apply(GITLAB_JWKS_PATH);
 
-            String gitLabJwksUrl = gitLabUrlProperty.getPropertyValue() + gitLabJwksPathProperty.getPropertyValue();
-
             // Get the key id (kid) from the JWT header
             String headerJson = new String(Base64.getUrlDecoder().decode(idToken.split("\\.")[0]));
             String kid = (String) new ObjectMapper().readValue(headerJson, Map.class).get("kid");
 
             Claims claims = Jwts.parser()
-                    .verifyWith(getPublicKeyFromJwks(getJwks(gitLabJwksUrl), kid))
+                    .verifyWith(GitLabClient.getPublicKeyFromJwks(gitLabUrlProperty.getPropertyValue(),
+                            gitLabJwksPathProperty.getPropertyValue(), kid))
                     .build()
                     .parseSignedClaims(idToken)
                     .getPayload();
 
             // If autoCreate is enabled and the project doesn't exist, create the project
-            final String projectName = List.of(claims.get("project_path", String.class).split("/")).getLast();
+            final String projectName = List.of(claims.get(GitLabClient.PROJECT_PATH_CLAIM, String.class).split("/"))
+                    .getLast();
             final String projectVersion = claims
-                    .get(claims.get("ref_type", String.class).equals("tag") ? "ref" : "ref_path", String.class);
+                    .get(claims.get(GitLabClient.REF_TYPE_CLAIM, String.class).equals("tag") ? "ref"
+                            : GitLabClient.REF_PATH_CLAIM, String.class);
             Project project = qm.getProject(projectName, projectVersion);
             if (project == null) {
                 if (autoCreateProject
@@ -438,10 +430,11 @@ public class BomResource extends AbstractApiResource {
                             .entity("The principal does not have permission to create project.").build();
             }
 
-            if (claims.get("project_path", String.class) == null)
+            if (claims.get(GitLabClient.PROJECT_PATH_CLAIM, String.class) == null)
                 return Response.status(Response.Status.BAD_REQUEST).entity("Missing project_path claim").build();
 
-            if (!claims.get("ref_type", String.class).equals("tag") && claims.get("ref_path", String.class) == null)
+            if (!claims.get(GitLabClient.REF_TYPE_CLAIM, String.class).equals("tag")
+                    && claims.get(GitLabClient.REF_PATH_CLAIM, String.class) == null)
                 return Response.status(Response.Status.BAD_REQUEST).entity("Invalid ref_type or missing ref_path claim")
                         .build();
 
@@ -752,80 +745,24 @@ public class BomResource extends AbstractApiResource {
         }
     }
 
-    private void createNewProject(String projectName, String projectVersion,
-            List<org.dependencytrack.model.Tag> projectTags, Project parent,
-            boolean isLatestProjectVersion) {
+    private void createNewProject(String name, String version,
+            List<org.dependencytrack.model.Tag> tags, Project parent,
+            boolean isLatest) {
         try (QueryManager qm = new QueryManager()) {
-            final String trimmedProjectName = StringUtils.trimToNull(projectName);
-            final String trimmedProjectVersion = StringUtils.trimToNull(projectVersion);
+            final String trimmedProjectName = StringUtils.trimToNull(name);
+            final String trimmedProjectVersion = StringUtils.trimToNull(version);
 
-            if (isLatestProjectVersion) {
+            if (isLatest) {
                 final Project oldLatest = qm.getLatestProjectVersion(trimmedProjectName);
                 if (oldLatest != null) {
                     requireAccess(qm, oldLatest, "Access to the previous latest project version is forbidden");
                 }
             }
             Project project = qm.createProject(trimmedProjectName, null,
-                    trimmedProjectVersion, projectTags, parent,
-                    null, null, isLatestProjectVersion, true);
+                    trimmedProjectVersion, tags, parent,
+                    null, null, isLatest, true);
             Principal principal = getPrincipal();
             qm.updateNewProjectACL(project, principal);
         }
-    }
-
-    private static JSONObject getJwks(String jwksUrl) throws IOException, InterruptedException {
-        HttpClient client = HttpClient.newHttpClient();
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(jwksUrl))
-                .header("Accept", "application/json")
-                .GET()
-                .build();
-
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200) 
-            throw new IOException("Failed to fetch JWKS from URL: " + jwksUrl + ". Status code: " + response.statusCode());
-
-        if (!response.body().trim().startsWith("{"))
-            throw new IOException("Unexpected response: " + response.body());
-
-        return new ObjectMapper().readValue(response.body(), JSONObject.class);
-    }
-
-    private static PublicKey getPublicKeyFromJwks(JSONObject jwks, String kid) throws Exception {
-        Object keysObject = jwks.get("keys");
-        if (!(keysObject instanceof List<?>))
-            throw new IllegalArgumentException("Invalid JWKS format: 'keys' is not a list");
-
-        List<?> keys = (List<?>) keysObject;
-
-        for (Object key : keys) {
-            if (!(key instanceof Map<?, ?>))
-                throw new IllegalArgumentException("Invalid JWKS format: key is not a map");
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> keyMap = (Map<String, Object>) key;
-                    
-            JSONObject jsonKey = new JSONObject();
-            jsonKey.put("kty", keyMap.get("kty"));
-            jsonKey.put("alg", keyMap.get("alg"));
-            jsonKey.put("use", keyMap.get("use"));
-            jsonKey.put("kid", keyMap.get("kid"));
-            jsonKey.put("n", keyMap.get("n"));
-            jsonKey.put("e", keyMap.get("e"));
-            
-            if (jsonKey.get("kid").equals(kid)) {
-                if (!jsonKey.containsKey("n") || !jsonKey.containsKey("e"))
-                    throw new IllegalArgumentException("Missing modulus 'n' or exponent 'e' in JWKS key: " + jsonKey);
-                
-                RSAPublicKeySpec spec = new RSAPublicKeySpec(
-                    new BigInteger(1, Base64.getUrlDecoder().decode(jsonKey.get("n").toString())), 
-                    new BigInteger(1, Base64.getUrlDecoder().decode(jsonKey.get("e").toString()))
-                    );
-                
-                return KeyFactory.getInstance("RSA").generatePublic(spec);
-            }
-        }
-        throw new IllegalArgumentException("Public key not found for kid: " + kid);
     }
 }

@@ -377,7 +377,7 @@ public class BomResource extends AbstractApiResource {
     @PermissionRequired(Permissions.Constants.BOM_UPLOAD)
     @ResourceAccessRequired
     public Response uploadBomGitLab(
-            @FormDataParam("gitLab_token") String idToken,
+            @FormDataParam("gitLabToken") String idToken,
             @FormDataParam("bom") String bom,
             @FormDataParam("isLatest") @DefaultValue("false") boolean isLatest) {
 

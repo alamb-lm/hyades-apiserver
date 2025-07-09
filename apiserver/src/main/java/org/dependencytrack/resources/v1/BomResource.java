@@ -50,10 +50,12 @@ import org.dependencytrack.event.BomUploadEvent;
 import org.dependencytrack.event.kafka.KafkaEventDispatcher;
 import org.dependencytrack.filestorage.FileStorage;
 import org.dependencytrack.integrations.gitlab.GitLabClient;
+import org.dependencytrack.integrations.gitlab.GitLabRole;
 import org.dependencytrack.model.BomValidationMode;
 import org.dependencytrack.model.Component;
 import org.dependencytrack.model.ConfigPropertyConstants;
 import org.dependencytrack.model.Project;
+import org.dependencytrack.model.Role;
 import org.dependencytrack.model.validation.ValidUuid;
 import org.dependencytrack.notification.NotificationConstants;
 import org.dependencytrack.notification.NotificationGroup;
@@ -105,7 +107,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
-
 import static java.util.function.Predicate.not;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_MODE;
 import static org.dependencytrack.model.ConfigPropertyConstants.BOM_VALIDATION_TAGS_EXCLUSIVE;
@@ -352,7 +353,7 @@ public class BomResource extends AbstractApiResource {
                             }
                             requireAccess(qm, parent, "Access to the specified parent project is forbidden");
                         }
-                        createNewProject(request.getProjectName(), request.getProjectVersion(), request.getProjectTags(), parent, request.isLatestProjectVersion());
+                        createNewProject(request.getProjectName(), request.getProjectVersion(), request.getProjectTags(), parent, request.isLatestProjectVersion(), null);
                     } else {
                         return Response.status(Response.Status.UNAUTHORIZED).entity("The principal does not have permission to create project.").build();
                     }
@@ -374,6 +375,7 @@ public class BomResource extends AbstractApiResource {
             @ApiResponse(responseCode = "404", description = "The project could not be found")
     })
     @PermissionRequired(Permissions.Constants.BOM_UPLOAD)
+    @ResourceAccessRequired
     public Response uploadBomGitLab(
             @FormDataParam("gitLab_token") String idToken,
             @FormDataParam("bom") String bom,
@@ -421,10 +423,18 @@ public class BomResource extends AbstractApiResource {
                     .get(claims.get(GitLabClient.REF_TYPE_CLAIM, String.class).equals("tag") ? "ref"
                             : GitLabClient.REF_PATH_CLAIM, String.class);
             Project project = qm.getProject(projectName, projectVersion);
+
+            final GitLabRole gitLabRole = GitLabRole
+                    .valueOf(claims.get(GitLabClient.USER_ACCESS_LEVEL_CLAIM, String.class).toUpperCase());
+            Role role = (gitLabRole != null)
+                    ? qm.getRoleByName(gitLabRole.getDescription())
+                    : null;
+
             if (project == null) {
                 if (autoCreateProject
-                        && Set.of("owner", "maintainer").contains(claims.get("user_access_level", String.class)))
-                    createNewProject(projectName, projectVersion, null, null, isLatest);
+                        && Set.of("owner", "maintainer")
+                                .contains(claims.get(GitLabClient.USER_ACCESS_LEVEL_CLAIM, String.class)))
+                    createNewProject(projectName, projectVersion, null, null, isLatest, role);
                 else
                     return Response.status(Response.Status.UNAUTHORIZED)
                             .entity("The principal does not have permission to create project.").build();
@@ -556,7 +566,7 @@ public class BomResource extends AbstractApiResource {
                         final List<org.dependencytrack.model.Tag> tags = (projectTags != null && !projectTags.isBlank())
                                 ? Arrays.stream(projectTags.split(",")).map(String::trim).filter(not(String::isEmpty)).map(org.dependencytrack.model.Tag::new).toList()
                                 : null;
-                        createNewProject(projectName, projectVersion, tags, parent, isLatest);
+                        createNewProject(projectName, projectVersion, tags, parent, isLatest, null);
                     } else {
                         return Response.status(Response.Status.UNAUTHORIZED).entity("The principal does not have permission to create project.").build();
                     }
@@ -747,7 +757,7 @@ public class BomResource extends AbstractApiResource {
 
     private void createNewProject(String name, String version,
             List<org.dependencytrack.model.Tag> tags, Project parent,
-            boolean isLatest) {
+            boolean isLatest, Role role) {
         try (QueryManager qm = new QueryManager()) {
             final String trimmedProjectName = StringUtils.trimToNull(name);
             final String trimmedProjectVersion = StringUtils.trimToNull(version);
@@ -762,7 +772,7 @@ public class BomResource extends AbstractApiResource {
                     trimmedProjectVersion, tags, parent,
                     null, null, isLatest, true);
             Principal principal = getPrincipal();
-            qm.updateNewProjectACL(project, principal);
+            qm.updateNewProjectACL(project, principal, role);
         }
     }
 }

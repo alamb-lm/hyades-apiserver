@@ -68,6 +68,7 @@ public class GitLabClient {
     public static final String PROJECT_PATH_CLAIM = "project_path";
     public static final String REF_PATH_CLAIM = "ref_path";
     public static final String REF_TYPE_CLAIM = "ref_type";
+    public static final String USER_ACCESS_LEVEL_CLAIM = "user_access_level";
 
     private final Map<GitLabRole, List<Permissions>> rolePermissions = Map.of(
             GitLabRole.GUEST, List.of(
